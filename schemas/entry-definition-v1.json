@@ -1,0 +1,20 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object","additionalProperties":false,
+  "required":["definition_version","execution","operation","input_slots","request","response"],
+  "properties":{
+    "definition_version":{"const":1},"execution":{"const":"sync_http"},"operation":{"enum":["generate","edit"]},
+    "input_slots":{"type":"array","maxItems":1,"uniqueItems":true,"items":{"const":"image"}},
+    "request":{"type":"object","additionalProperties":false,"required":["method","path","authentication","encoding","fields"],"properties":{
+      "method":{"const":"POST"},"path":{"type":"string","minLength":1,"maxLength":256},
+      "authentication":{"enum":["deployment_bearer","none"]},"encoding":{"enum":["json","multipart"]},
+      "fields":{"type":"object","maxProperties":64,"propertyNames":{"pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"additionalProperties":{"type":"object","additionalProperties":false,"properties":{"from":{"enum":["/model/upstream_model","/request/prompt","/request/output/size","/request/output/count"]},"constant":{}},"oneOf":[{"required":["from"],"not":{"required":["constant"]}},{"required":["constant"],"not":{"required":["from"]}}]}},
+      "files":{"type":"array","maxItems":1,"items":{"type":"object","additionalProperties":false,"required":["field","input_slot"],"properties":{"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"input_slot":{"const":"image"}}}}
+    }},
+    "response":{"type":"object","additionalProperties":false,"required":["encoding","success_http_statuses","images_pointer","max_images","sources"],"properties":{
+      "encoding":{"enum":["json","binary"]},"success_http_statuses":{"type":"array","minItems":1,"maxItems":16,"uniqueItems":true,"items":{"type":"integer","minimum":200,"maximum":299}},
+      "error_pointer":{"type":"string","maxLength":256},"images_pointer":{"type":"string","maxLength":256},"max_images":{"const":1},
+      "sources":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"object","additionalProperties":false,"required":["kind","pointer"],"properties":{"kind":{"enum":["url","base64"]},"pointer":{"type":"string","maxLength":256}}}}
+    }}
+  }
+}

@@ -1,0 +1,5 @@
+{
+ "definition_version":1,"execution":"sync_http","operation":"generate","input_slots":[],
+ "request":{"method":"POST","path":"generate","authentication":"deployment_bearer","encoding":"json","fields":{"model":{"from":"/model/upstream_model"},"prompt":{"from":"/request/prompt"},"size":{"from":"/request/output/size"},"count":{"constant":1}}},
+ "response":{"encoding":"json","success_http_statuses":[200],"error_pointer":"/error","images_pointer":"/images","max_images":1,"sources":[{"kind":"url","pointer":"/url"},{"kind":"base64","pointer":"/b64_json"}]}
+}

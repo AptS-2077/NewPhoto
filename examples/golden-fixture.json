@@ -1,0 +1,6 @@
+{
+ "context":{"model":{"upstream_model":"mock-ok"},"request":{"prompt":"golden fixture","output":{"size":"1024x1024","count":1}}},
+ "expected_request":{"model":"mock-ok","prompt":"golden fixture","size":"1024x1024","count":1},
+ "response":{"images":[{"url":"http://127.0.0.1:19091/result.png"}]},
+ "expected_source":"url"
+}

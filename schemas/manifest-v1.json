@@ -1,0 +1,14 @@
+{
+ "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
+ "required":["manifest_version","plugin_id","version","kind","runtime","host_api","name","description","entrypoints"],
+ "properties":{
+  "manifest_version":{"const":1},"plugin_id":{"type":"string","pattern":"^[a-z][a-z0-9.-]{2,127}$"},
+  "version":{"type":"string","pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+$","maxLength":64},
+  "kind":{"const":"entry_format"},"runtime":{"const":"declarative_http_v1"},"host_api":{"const":"1"},
+  "name":{"type":"string","minLength":1,"maxLength":128},"description":{"type":"string","maxLength":2048},"author":{"type":"string","maxLength":128},
+  "config_schema":{"type":"string","maxLength":256},
+  "entrypoints":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","additionalProperties":false,"required":["entry_format_id","name","operation","definition"],"properties":{
+   "entry_format_id":{"type":"string","pattern":"^[a-z][a-z0-9.-]{2,127}$"},"name":{"type":"string","minLength":1,"maxLength":128},"operation":{"enum":["generate","edit"]},"definition":{"type":"string","maxLength":256}
+  }}}
+ }
+}

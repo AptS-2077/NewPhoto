@@ -1,0 +1,72 @@
+name: newphoto
+services:
+  db:
+    image: postgres:18.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: newphoto
+      POSTGRES_USER: newphoto
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newphoto -d newphoto"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [database]
+  app:
+    build: .
+    image: newphoto:0.1.0-beta.1
+    restart: unless-stopped
+    init: true
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      NEWPHOTO_PUBLIC_ORIGIN: ${NEWPHOTO_PUBLIC_ORIGIN:?Set an HTTPS origin}
+      NEWPHOTO_COOKIE_SECURE: "true"
+      NEWPHOTO_MASTER_KEY_FILE: /run/secrets/newphoto_master_key
+      NEWPHOTO_ALLOWED_UPSTREAMS: ${NEWPHOTO_ALLOWED_UPSTREAMS:-}
+      NEWPHOTO_RESULT_HOSTS: ${NEWPHOTO_RESULT_HOSTS:-}
+      NEWPHOTO_TASK_CONCURRENCY: ${NEWPHOTO_TASK_CONCURRENCY:-2}
+      RUST_LOG: ${RUST_LOG:-newphoto=info}
+    secrets: [newphoto_master_key]
+    volumes:
+      - image_and_plugin_data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [database, frontend]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    pids_limit: 160
+    stop_grace_period: 20s
+  https:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      NEWPHOTO_DOMAIN: ${NEWPHOTO_DOMAIN:?Set the public domain}
+      NEWPHOTO_ACME_EMAIL: ${NEWPHOTO_ACME_EMAIL:?Set certificate contact email}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [frontend]
+volumes:
+  postgres_data:
+  image_and_plugin_data:
+  caddy_data:
+  caddy_config:
+secrets:
+  newphoto_master_key:
+    file: ./secrets/master.key
+networks:
+  database:
+    internal: true
+  frontend:

@@ -1,0 +1,7 @@
+{
+ "manifest_version":1,"plugin_id":"example.simple-image","version":"1.0.0",
+ "kind":"entry_format","runtime":"declarative_http_v1","host_api":"1",
+ "name":"Simple Image Adapter","description":"NewPhoto 同步图片测试服务入口；仅用于 Mock 验收，不代表真实上游兼容。",
+ "author":"NewPhoto",
+ "entrypoints":[{"entry_format_id":"example.simple-image.generate","name":"Simple Image Generate","operation":"generate","definition":"entries/generate.json"}]
+}

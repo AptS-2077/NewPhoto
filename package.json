@@ -1,0 +1,14 @@
+{
+  "name": "newphoto-tools",
+  "version": "0.1.0-beta.1",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "dev:db": "node scripts/dev-db.mjs",
+    "mock": "node examples/mock-server.mjs",
+    "build:web": "node scripts/build-web.mjs",
+    "test:api": "python tests/acceptance.py"
+  },
+  "devDependencies": {"embedded-postgres": "18.6.0-beta.19"}
+}
