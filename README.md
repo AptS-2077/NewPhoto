@@ -10,6 +10,14 @@
 入口格式与实际模型配置分离。内置 `openai.images.generate`、`openai.images.edit`，
 不预设特定最新模型，也不宣称仅更改地址就兼容所有服务。
 
+## 预编译平台包
+
+[GitHub Releases](https://github.com/AptS-2077/NewPhoto/releases) 提供 Windows x64、
+Linux x64/ARM64、macOS Intel/Apple Silicon 平台包，版本以发布页实际附件为准。
+每包含服务程序、已编译网页、空配置模板和运行说明，需要自行准备 PostgreSQL。
+下载后核对 SHA256SUMS，再按包内 README 初始化自己的主密钥和首个管理员。
+发布流水线固定读取原有版本标签，不把本地数据、密钥或验收资料装入包中。
+
 ## 生产部署
 
 需要 Linux、Docker Engine/Compose、域名和指向服务器的 DNS；80/443 用于

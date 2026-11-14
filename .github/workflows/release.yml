@@ -1,0 +1,154 @@
+name: Build platform release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing application tag to build
+        required: true
+        default: v0.1.0-beta.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  web:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.tag }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.18.0'
+      - name: Validate immutable application version
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python tests/release.py
+          python scripts/package-release.py validate --source source --tag "$RELEASE_TAG"
+          echo "sha=$(git -C source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Install locked Rust toolchain and bindings
+        working-directory: source
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --target wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Build and check browser application
+        working-directory: source
+        run: |
+          node --check web/app.js
+          node tests/theme.mjs
+          node scripts/build-web.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-web
+          path: source/web/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: web
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build/newphoto
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.web.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-web
+          path: web-dist
+      - name: Install pinned native toolchain
+        working-directory: source
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: rustup toolchain install 1.96.1 --profile minimal --target "$BUILD_TARGET"
+      - name: Test and build native service
+        working-directory: source
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          cargo test --locked --target "$BUILD_TARGET" -p newphoto -j 2
+          cargo build --release --locked --target "$BUILD_TARGET" -p newphoto -j 2
+      - name: Smoke test, scan and package
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python scripts/package-release.py build --source source --web web-dist --target "$BUILD_TARGET" --tag "$RELEASE_TAG" --output packages
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: package-${{ matrix.target }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [web, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: package-*
+          path: packages
+          merge-multiple: true
+      - name: Verify all platform packages and publish prerelease
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ needs.web.outputs.source_sha }}
+        run: python scripts/publish-release.py --directory packages
