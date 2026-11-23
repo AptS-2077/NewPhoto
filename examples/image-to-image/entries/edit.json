@@ -1,0 +1,27 @@
+{
+  "definition_version": 1,
+  "execution": "sync_http",
+  "operation": "edit",
+  "input_slots": ["image"],
+  "request": {
+    "method": "POST",
+    "path": "i2i",
+    "authentication": "deployment_bearer",
+    "encoding": "json",
+    "fields": {
+      "model": { "from": "/model/upstream_model" },
+      "prompt": { "from": "/request/prompt" },
+      "size": { "from": "/request/output/size" }
+    },
+    "reference_images": { "encoding": "base64", "field": "images", "weights_field": "weights" }
+  },
+  "response": {
+    "encoding": "json",
+    "success_http_statuses": [200],
+    "error_pointer": "/error",
+    "images_pointer": "/data",
+    "max_images": 1,
+    "sources": [{ "kind": "base64", "pointer": "/b64_json" }],
+    "usage_pointer": "/usage"
+  }
+}

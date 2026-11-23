@@ -1,0 +1,5 @@
+{
+  "prompt": "保留主体，调整背景光线",
+  "weights": [0.75, 0.25],
+  "usage": { "input_tokens": 16, "output_tokens": 32, "total_tokens": 48 }
+}

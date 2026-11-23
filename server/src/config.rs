@@ -68,22 +68,41 @@ impl Config {
         })
     }
     pub fn encrypt(&self, text: &str) -> Result<String> {
+        Ok(STANDARD.encode(self.seal(b"", text.as_bytes())?))
+    }
+    pub fn decrypt(&self, encoded: &str) -> Result<String> {
+        Ok(String::from_utf8(
+            self.open(b"", &STANDARD.decode(encoded)?)?,
+        )?)
+    }
+    pub fn seal(&self, purpose: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         let nonce_bytes = rand::random::<[u8; 12]>();
         let encrypted = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), text.as_bytes())
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                aes_gcm::aead::Payload {
+                    msg: bytes,
+                    aad: purpose,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-        Ok(STANDARD.encode([nonce_bytes.as_slice(), &encrypted].concat()))
+        Ok([nonce_bytes.as_slice(), &encrypted].concat())
     }
-    pub fn decrypt(&self, encoded: &str) -> Result<String> {
-        let bytes = STANDARD.decode(encoded)?;
+    pub fn open(&self, purpose: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         if bytes.len() < 28 {
             bail!("invalid encrypted secret");
         }
         let plain = self
             .cipher
-            .decrypt(Nonce::from_slice(&bytes[..12]), &bytes[12..])
+            .decrypt(
+                Nonce::from_slice(&bytes[..12]),
+                aes_gcm::aead::Payload {
+                    msg: &bytes[12..],
+                    aad: purpose,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("decryption failed"))?;
-        Ok(String::from_utf8(plain)?)
+        Ok(plain)
     }
 }

@@ -13,12 +13,13 @@
 | GET | /auth/me | 当前 user 与 csrf_token |
 | POST | /auth/logout | 撤销当前会话，清 Cookie |
 | GET/PATCH | /me | GET 同当前身份；PATCH 仅 `{display_name,revision}` |
-| GET | /entry-formats | `{registry_revision,items}`；仅已发布入口，两个内置格式始终存在 |
+| GET | /entry-formats | `{registry_revision,items,image_input:{enabled,max_bytes}}`；入口包含 `capabilities` 和 `image_input` |
 | GET | /models?entry_format_id=… | 获授权且启用的配置；不含地址、上游密钥 |
 | POST | /assets/inputs | multipart 单个 `image`；返回资产 ID、格式、尺寸 |
+| POST | /images/reference | 上传一张参考图，multipart 字段为 `image`；成功返回 201 和 `reference_id` |
 | POST | /tasks | 必须带 `Idempotency-Key`，见下文；返回 202 |
 | GET | /tasks | 本人任务；管理员可显式 `all_users=true`，留审计 |
-| GET | /tasks/{id} | `{task,server_now}`；真实时间、状态、最新上游摘要与资产 |
+| GET | /tasks/{id} | `{task,server_now}`；含状态、生成图、按提交顺序排列的参考图和上游用量 |
 | GET | /tasks/{id}/upstream-requests | 各阶段脱敏 HTTP 记录 |
 | GET | /images | 生成结果；与任务相同的读取规则 |
 | GET | /assets/{id}/preview?thumb=true | 授权图片/缩略图；禁止静态旁路 |
@@ -29,6 +30,7 @@
 | GET/POST | /admin/models | 管理员列表/创建模型 |
 | GET/PATCH/DELETE | /admin/models/{id} | 详情、修改、软删除；密钥仅 has_secret 和掩码 |
 | POST | /admin/models/{id}/test | 与创建任务同结构，加 `confirm_cost:true`，正常任务链路 |
+| GET/PATCH | /admin/settings | 管理员读取或更新图生图开关和单张大小上限，PATCH 需 `revision` |
 | GET | /admin/plugins | 包信息、期望/生效状态、注册表版本 |
 | POST | /admin/plugins/install | multipart `package`，无认证入口另需 `approve_no_auth=true` |
 | GET/PATCH/DELETE | /admin/plugins/{id} | 详情、允许配置修改、无引用时软移除 |
@@ -52,6 +54,17 @@ MODEL_UNAVAILABLE、REGISTRY_CHANGED、PLUGIN_IN_USE、UPSTREAM_HTTP_ERROR、
 SUBMISSION_UNKNOWN、RESULT_UNAVAILABLE。任务详情的 `error_code` 保存终态机器错误码，上游失败在通信记录中独立保存；
 本地创建任务 202 不表示上游 202。
 
+| 图生图错误码 | HTTP | 含义 |
+|---|---|---|
+| `VALIDATION_ERROR` | 422 | 图片格式、大小、尺寸、数量或权重不合法 |
+| `IMAGE_INPUT_DISABLED` | 409 | 管理员关闭了图生图 |
+| `IMAGE_INPUT_UNSUPPORTED` | 422 | 入口未声明 `image.input` |
+| `IMAGE_INPUT_REQUIRED` | 422 | 当前插件要求显式使用图生图 |
+| `REFERENCE_QUOTA` | 409 | 参考图上传总量达到 100 MiB |
+| `REFERENCE_UPLOAD_TIMEOUT` | 408 | 参考图上传超时 |
+| `PERMISSION_DENIED` | 403 | 创建任务时引用了其他账号的图片 |
+| `NOT_FOUND` | 404 | 参考图不存在，或当前账号无权直接预览该图片 |
+
 ## 创建任务
 
 ```json
@@ -66,9 +79,31 @@ SUBMISSION_UNKNOWN、RESULT_UNAVAILABLE。任务详情的 `error_code` 保存终
 }
 ```
 
-尺寸以模型 capabilities.sizes 为准。generate 不接受原图；edit 恰好一张。
+尺寸以模型 `capabilities.sizes` 为准。省略 `mode` 的旧请求仍可使用 generate，旧 edit 入口继续接受单个 `input_asset_ids`。
 相同用户同键同请求回放原任务；同键不同内容 409；回放优先于新模型版本校验。
 再次生成用新的 key，可带 `parent_task_id`，可能再次计费。
+
+### 图生图
+
+通过 `POST /api/v1/images/reference` 上传带有实际媒体类型的 PNG、JPEG 或 WebP。
+服务端流式接收并校验文件头、解码结果和像素数，默认单张 10 MiB，平台像素上限为 40 MP。
+管理员可将上限设为 256 KiB 到 25 MiB，任务另受插件与模型限制。上传返回
+`reference_id`、`mime`、`width`、`height`、`byte_size`、`preview_url` 和 `download_url`。
+也可直接引用本人 `GET /api/v1/images` 返回的生成图 ID。
+
+创建新任务时设置 `mode:"i2i"`，并提供 1 到 4 张参考图，例如
+`"references":[{"id":"<UUID>","weight":0.75}]`。数组顺序对应上游的图片顺序。
+支持权重的入口使用 0 到 1 的单图强度，默认 0.75。对其他入口省略 `weight`。
+任务、图片历史及详情中的 `reference_assets` 包含参考图信息和已应用的权重，
+`assets` 仍用于返回生成图。上游提供用量时，`usage` 只保留输入、输出和总 token 数。
+
+新上传的参考图与缩略图使用主密钥加密。每个账号的参考图上传总量上限为 100 MiB。
+未被任务引用的上传在 24 小时后进入定期清理，已引用资产随任务历史保留。
+声明 URL 传输的插件收到 10 分钟有效的签名地址，生产环境配置上游可访问的 HTTPS
+`NEWPHOTO_PUBLIC_ORIGIN`。地址可用于读取对应参考图，按凭据处理。
+
+管理员可使用 `PATCH /api/v1/admin/settings` 提交 `{"enabled":true,"max_bytes":10485760,"revision":1}`。
+开关作用于新上传、新图生图任务和尚未提交上游的显式图生图任务。
 
 任务状态：queued → preparing → submitting → saving → succeeded；失败为 failed、
 submission_unknown 或 result_unavailable。可能已经提交时禁止自动重发；

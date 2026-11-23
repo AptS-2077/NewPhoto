@@ -213,6 +213,8 @@ async fn main() -> Result<()> {
         .route("/entry-formats", get(registry::formats))
         .route("/models", get(registry::models))
         .route("/assets/inputs", post(storage::upload))
+        .route("/images/reference", post(storage::upload_reference))
+        .route("/images/reference/{token}", get(storage::reference_link))
         .route("/assets/{id}/preview", get(storage::preview))
         .route("/assets/{id}/download", get(storage::download))
         .route("/tasks", get(tasks::list).post(tasks::create))
@@ -220,6 +222,10 @@ async fn main() -> Result<()> {
         .route("/tasks/{id}/upstream-requests", get(tasks::upstream))
         .route("/images", get(tasks::images))
         .route("/admin/users", get(admin::users).post(admin::create_user))
+        .route(
+            "/admin/settings",
+            get(admin::settings).patch(admin::update_settings),
+        )
         .route(
             "/admin/users/{id}",
             get(admin::user_detail)

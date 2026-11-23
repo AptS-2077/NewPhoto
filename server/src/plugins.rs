@@ -122,7 +122,47 @@ fn unpack(bytes: Vec<u8>, approve_no_auth: bool) -> ApiResult<Package> {
         if definition["request"]["authentication"] == "none" && !approve_no_auth {
             return Err(ApiError::validation("无认证入口必须由管理员明确批准"));
         }
-        if definition["operation"] == "edit"
+        let capabilities: Vec<String> = serde_json::from_value(
+            declaration
+                .get("capabilities")
+                .cloned()
+                .unwrap_or(json!([])),
+        )
+        .map_err(|_| ApiError::validation("入口能力声明无效"))?;
+        let image_input: Option<crate::registry::ImageInput> =
+            serde_json::from_value(declaration["image_input"].clone())
+                .map_err(|_| ApiError::validation("图生图配置无效"))?;
+        let mapping = &definition["request"]["reference_images"];
+        if image_input.is_some() == capabilities.is_empty()
+            || image_input.is_some() != mapping.is_object()
+        {
+            return Err(ApiError::validation(
+                "image.input、image_input 和 reference_images 必须同时声明",
+            ));
+        }
+        if let Some(input) = &image_input {
+            let request = &definition["request"];
+            let multipart = mapping["encoding"] == "multipart";
+            let field = text(mapping, "field")?;
+            let weights = mapping["weights_field"].as_str();
+            if definition["operation"] != "edit"
+                || definition["input_slots"] != json!(["image"])
+                || request["files"]
+                    .as_array()
+                    .is_some_and(|files| !files.is_empty())
+                || request["encoding"] != if multipart { "multipart" } else { "json" }
+                || (!multipart && field.ends_with("[]"))
+                || request["fields"].get(field).is_some()
+                || input.accepts_weights != weights.is_some()
+                || weights
+                    .is_some_and(|name| name == field || request["fields"].get(name).is_some())
+                || (mapping["encoding"] == "url" && mapping["flatten_alpha"] == true)
+            {
+                return Err(ApiError::validation(
+                    "图生图请求编码、文件槽或权重映射不匹配",
+                ));
+            }
+        } else if definition["operation"] == "edit"
             && (definition["request"]["encoding"] != "multipart"
                 || definition["input_slots"] != json!(["image"])
                 || definition["request"]["files"]
@@ -147,6 +187,7 @@ fn unpack(bytes: Vec<u8>, approve_no_auth: bool) -> ApiResult<Package> {
         for pointer in [
             definition["response"]["error_pointer"].as_str(),
             definition["response"]["images_pointer"].as_str(),
+            definition["response"]["usage_pointer"].as_str(),
         ]
         .into_iter()
         .flatten()
@@ -166,6 +207,8 @@ fn unpack(bytes: Vec<u8>, approve_no_auth: bool) -> ApiResult<Package> {
             name: text(declaration, "name")?.into(),
             operation: text(declaration, "operation")?.into(),
             definition,
+            capabilities,
+            image_input,
             installation_id: None,
             package_id: None,
             digest: digest.clone(),

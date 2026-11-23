@@ -1,3 +1,4 @@
+use crate::storage;
 use crate::{
     auth::{Auth, PERMISSIONS, audit, password_hash, validate_permissions, validate_username},
     error::{ApiError, ApiResult, reject_unknown, revision, text},
@@ -39,6 +40,62 @@ impl ListQuery {
         )
     }
 }
+
+pub async fn settings(State(app): State<App>, auth: Auth) -> ApiResult<Json<Value>> {
+    auth.user.admin()?;
+    let settings: Value =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key='image_input_settings'")
+            .fetch_one(&app.pool)
+            .await?;
+    Ok(Json(settings))
+}
+
+pub async fn update_settings(
+    State(app): State<App>,
+    auth: Auth,
+    Json(body): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    auth.user.admin()?;
+    reject_unknown(&body, &["enabled", "max_bytes", "revision"])?;
+    let expected_revision = revision(&body)?;
+    if body.get("enabled").is_none() && body.get("max_bytes").is_none() {
+        return Err(ApiError::validation("至少修改一项图生图设置"));
+    }
+    let mut transaction = app.pool.begin().await?;
+    let mut settings: Value = sqlx::query_scalar(
+        "SELECT value FROM app_settings WHERE key='image_input_settings' FOR UPDATE",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if settings["revision"].as_i64() != Some(expected_revision) {
+        return Err(ApiError::conflict(
+            "CONFLICT",
+            "图生图设置已由其他管理员修改，请刷新后重试",
+        ));
+    }
+    if let Some(enabled) = body.get("enabled") {
+        settings["enabled"] = enabled
+            .as_bool()
+            .map(Value::from)
+            .ok_or_else(|| ApiError::validation("enabled 必须是布尔值"))?;
+    }
+    if let Some(max_bytes) = body.get("max_bytes") {
+        let value = max_bytes
+            .as_i64()
+            .filter(|value| (256 * 1024..=storage::MAX_IMAGE as i64).contains(value))
+            .ok_or_else(|| ApiError::validation("max_bytes 必须介于 256 KiB 和 25 MiB 之间"))?;
+        settings["max_bytes"] = Value::from(value);
+    }
+    settings["revision"] = Value::from(expected_revision + 1);
+    sqlx::query("UPDATE app_settings SET value=$1 WHERE key='image_input_settings'")
+        .bind(&settings)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    audit(&app, auth.user.id, "image_input_settings", "settings.update", json!({"enabled":settings["enabled"],"max_bytes":settings["max_bytes"],"revision":settings["revision"]})).await?;
+    Ok(Json(settings))
+}
+
 pub async fn users(
     State(app): State<App>,
     auth: Auth,

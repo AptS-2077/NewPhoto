@@ -3,15 +3,26 @@ use crate::{
     auth::{Auth, audit, hash},
     error::{ApiError, ApiResult, reject_unknown, text},
     state::App,
+    storage,
 };
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
+use std::collections::HashSet;
 use uuid::Uuid;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Reference {
+    id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight: Option<f64>,
+}
 
 pub async fn create(
     State(app): State<App>,
@@ -40,6 +51,8 @@ pub async fn create_inner(
             "input_asset_ids",
             "output",
             "parent_task_id",
+            "mode",
+            "references",
         ],
     )?;
     let key = headers
@@ -126,20 +139,123 @@ pub async fn create_inner(
     let input_ids: Vec<Uuid> =
         serde_json::from_value(body.get("input_asset_ids").cloned().unwrap_or(json!([])))
             .map_err(|_| ApiError::validation("原图 ID 数组无效"))?;
-    if entry.operation == "edit" && input_ids.len() != 1
-        || entry.operation == "generate" && !input_ids.is_empty()
-    {
-        return Err(ApiError::validation("编辑必须提供一张原图；生成不接受原图"));
-    }
-    for input_id in input_ids {
-        let input=sqlx::query("SELECT mime,byte_size,width,height FROM assets WHERE id=$1 AND user_id=$2 AND kind='input'").bind(input_id).bind(auth.user.id).fetch_optional(&mut *transaction).await?.ok_or_else(ApiError::missing)?;
+    let explicit_i2i = match body.get("mode") {
+        None => false,
+        Some(value) if value == "i2i" => true,
+        Some(value) if value == "t2i" && entry.operation == "generate" => false,
+        _ => {
+            return Err(ApiError::validation(
+                "mode 必须与入口匹配，取值为 t2i 或 i2i",
+            ));
+        }
+    };
+    let (references, mode, per_image_limit) = if explicit_i2i {
+        let capability = entry.image_input().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "IMAGE_INPUT_UNSUPPORTED",
+                "当前插件入口未声明 image.input 能力",
+            )
+        })?;
+        let settings: Value = sqlx::query_scalar(
+            "SELECT value FROM app_settings WHERE key='image_input_settings' FOR SHARE",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        storage::require_reference_enabled(&settings)?;
+        if !input_ids.is_empty() {
+            return Err(ApiError::validation("图生图请使用 references 字段"));
+        }
+        let items = body["references"]
+            .as_array()
+            .filter(|items| !items.is_empty() && items.len() <= usize::from(capability.max_count))
+            .ok_or_else(|| {
+                ApiError::validation(format!("请选择 1–{} 张参考图", capability.max_count))
+            })?;
+        let mut seen = HashSet::new();
+        let mut references = Vec::with_capacity(items.len());
+        for item in items {
+            let mut reference: Reference = serde_json::from_value(item.clone())
+                .map_err(|_| ApiError::validation("参考图 ID 或强度格式无效"))?;
+            if !seen.insert(reference.id) {
+                return Err(ApiError::validation("不能重复引用同一张参考图"));
+            }
+            if reference
+                .weight
+                .is_some_and(|weight| !(0.0..=1.0).contains(&weight))
+            {
+                return Err(ApiError::validation("参考图强度必须在 0–1 之间"));
+            }
+            if capability.accepts_weights {
+                reference.weight = Some(reference.weight.unwrap_or(0.75));
+            } else if reference.weight.is_some() {
+                return Err(ApiError::validation("当前插件不支持设置参考图强度"));
+            }
+            references.push(reference);
+        }
+        (
+            references,
+            "i2i",
+            (capability.max_bytes as i64).min(settings["max_bytes"].as_i64().unwrap_or(0)),
+        )
+    } else {
+        if body.get("references").is_some() {
+            return Err(ApiError::validation("references 只适用于图生图模式"));
+        }
+        if entry.operation == "edit" {
+            if entry.definition["request"]["reference_images"].is_object() {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "IMAGE_INPUT_REQUIRED",
+                    "当前入口必须使用图生图模式",
+                ));
+            }
+            if input_ids.len() != 1 {
+                return Err(ApiError::validation("编辑必须提供一张原图"));
+            }
+            (
+                vec![Reference {
+                    id: input_ids[0],
+                    weight: None,
+                }],
+                "i2i",
+                storage::MAX_IMAGE as i64,
+            )
+        } else {
+            if !input_ids.is_empty() {
+                return Err(ApiError::validation("文生图不接受原图"));
+            }
+            (Vec::new(), "t2i", 0)
+        }
+    };
+    let mut total_reference_bytes = 0;
+    for reference in &references {
+        let input = if explicit_i2i {
+            let row = sqlx::query(
+                "SELECT user_id,mime,byte_size,width,height FROM assets WHERE id=$1 FOR KEY SHARE",
+            )
+            .bind(reference.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(ApiError::missing)?;
+            if row.get::<Uuid, _>("user_id") != auth.user.id {
+                return Err(ApiError::forbidden());
+            }
+            row
+        } else {
+            sqlx::query("SELECT mime,byte_size,width,height FROM assets WHERE id=$1 AND user_id=$2 AND kind='input' FOR KEY SHARE")
+                .bind(reference.id).bind(auth.user.id).fetch_optional(&mut *transaction).await?
+                .ok_or_else(ApiError::missing)?
+        };
         let mime: String = input.get("mime");
         let size: i64 = input.get("byte_size");
+        total_reference_bytes += size;
         let pixels =
             i64::from(input.get::<i32, _>("width")) * i64::from(input.get::<i32, _>("height"));
         if !model["capabilities"]["input_mimes"]
             .as_array()
             .is_some_and(|mimes| mimes.contains(&json!(mime)))
+            || size > per_image_limit
             || size
                 > model["capabilities"]["max_input_bytes"]
                     .as_i64()
@@ -151,6 +267,13 @@ pub async fn create_inner(
         {
             return Err(ApiError::validation("原图不符合模型的格式、体积或像素限制"));
         }
+    }
+    if entry.definition["request"]["reference_images"]["encoding"] == "base64"
+        && total_reference_bytes > storage::MAX_IMAGE as i64
+    {
+        return Err(ApiError::validation(
+            "Base64 参考图原始总大小不得超过 25 MiB",
+        ));
     }
     let parent: Option<Uuid> = body["parent_task_id"]
         .as_str()
@@ -169,14 +292,27 @@ pub async fn create_inner(
         }
     }
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO tasks(id,user_id,idempotency_key,request_hash,request,model_id,model_snapshot,entry_snapshot,registry_revision,status,parent_task_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued',$10)").bind(id).bind(auth.user.id).bind(key).bind(request_hash).bind(body).bind(model_id).bind(model).bind(json!(entry)).bind(snapshot.revision).bind(parent).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO tasks(id,user_id,idempotency_key,request_hash,request,model_id,model_snapshot,entry_snapshot,registry_revision,status,parent_task_id,mode,\"references\") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued',$10,$11,$12)")
+        .bind(id).bind(auth.user.id).bind(key).bind(request_hash).bind(body).bind(model_id)
+        .bind(model).bind(json!(entry)).bind(snapshot.revision).bind(parent).bind(mode)
+        .bind(json!(references)).execute(&mut *transaction).await?;
+    for (position, reference) in references.iter().enumerate() {
+        sqlx::query("INSERT INTO task_reference_assets(task_id,asset_id,position,weight) VALUES($1,$2,$3,$4)")
+            .bind(id).bind(reference.id).bind(position as i16).bind(reference.weight)
+            .execute(&mut *transaction).await?;
+    }
     transaction.commit().await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({"task_id":id,"status":"queued","detail_url":format!("/api/v1/tasks/{id}")})),
     ))
 }
-const TASK_VIEW: &str = "to_jsonb(t)-'model_snapshot'-'entry_snapshot'-'request_hash'-'lease_token'-'lease_until'||jsonb_build_object('model_display_name',model_snapshot->>'display_name','entry_format_id',entry_snapshot->>'id','entry_version',entry_snapshot->>'version','entry_digest',entry_snapshot->>'digest','elapsed_ms',COALESCE(total_ms,GREATEST(0,(extract(epoch FROM (now()-t.created_at))*1000)::bigint)),'latest_upstream',(SELECT jsonb_build_object('phase',phase,'http_status',http_status,'transport_error',transport_error,'summary',summary) FROM upstream_requests WHERE task_id=t.id ORDER BY started_at DESC LIMIT 1),'assets',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',a.id,'mime',a.mime,'width',a.width,'height',a.height)) FROM assets a WHERE a.task_id=t.id AND a.kind='result'),'[]'::jsonb))";
+const REFERENCE_VIEW: &str = "COALESCE((SELECT jsonb_agg(jsonb_build_object('id',a.id,'mime',a.mime,'width',a.width,'height',a.height,'byte_size',a.byte_size,'weight',r.weight) ORDER BY r.position) FROM task_reference_assets r JOIN assets a ON a.id=r.asset_id AND a.user_id=t.user_id WHERE r.task_id=t.id),'[]'::jsonb)";
+fn task_view() -> String {
+    format!(
+        "to_jsonb(t)-'model_snapshot'-'entry_snapshot'-'request_hash'-'lease_token'-'lease_until'||jsonb_build_object('model_display_name',model_snapshot->>'display_name','entry_format_id',entry_snapshot->>'id','entry_version',entry_snapshot->>'version','entry_digest',entry_snapshot->>'digest','elapsed_ms',COALESCE(total_ms,GREATEST(0,(extract(epoch FROM (now()-t.created_at))*1000)::bigint)),'latest_upstream',(SELECT jsonb_build_object('phase',phase,'http_status',http_status,'transport_error',transport_error,'summary',summary) FROM upstream_requests WHERE task_id=t.id ORDER BY started_at DESC LIMIT 1),'assets',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',a.id,'mime',a.mime,'width',a.width,'height',a.height)) FROM assets a WHERE a.task_id=t.id AND a.kind='result'),'[]'::jsonb),'reference_assets',{REFERENCE_VIEW})"
+    )
+}
 pub async fn authorize(app: &App, auth: &Auth, id: Uuid) -> ApiResult<()> {
     let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM tasks WHERE id=$1")
         .bind(id)
@@ -204,7 +340,7 @@ pub async fn list(
         audit(&app, auth.user.id, "tasks", "task.admin_list", json!({})).await?;
     }
     let (limit, offset) = query.paging();
-    let rows=sqlx::query_scalar::<_,Value>(&format!("SELECT {TASK_VIEW}||jsonb_build_object('username',u.username) FROM tasks t JOIN users u ON u.id=t.user_id WHERE ($1 OR t.user_id=$2) AND (t.message ILIKE $3 OR t.request->>'prompt' ILIKE $3) ORDER BY t.created_at DESC LIMIT $4 OFFSET $5")).bind(all).bind(auth.user.id).bind(query.search()).bind(limit).bind(offset).fetch_all(&app.pool).await?;
+    let rows=sqlx::query_scalar::<_,Value>(&format!("SELECT {}||jsonb_build_object('username',u.username) FROM tasks t JOIN users u ON u.id=t.user_id WHERE ($1 OR t.user_id=$2) AND (t.message ILIKE $3 OR t.request->>'prompt' ILIKE $3) ORDER BY t.created_at DESC LIMIT $4 OFFSET $5", task_view())).bind(all).bind(auth.user.id).bind(query.search()).bind(limit).bind(offset).fetch_all(&app.pool).await?;
     Ok(Json(
         json!({"items":rows,"page":offset/limit+1,"per_page":limit,"has_more":rows.len()==limit as usize,"server_now":chrono::Utc::now()}),
     ))
@@ -216,7 +352,7 @@ pub async fn detail(
 ) -> ApiResult<Json<Value>> {
     authorize(&app, &auth, id).await?;
     let row =
-        sqlx::query_scalar::<_, Value>(&format!("SELECT {TASK_VIEW} FROM tasks t WHERE id=$1"))
+        sqlx::query_scalar::<_, Value>(&format!("SELECT {} FROM tasks t WHERE id=$1", task_view()))
             .bind(id)
             .fetch_one(&app.pool)
             .await?;
@@ -248,7 +384,7 @@ pub async fn images(
         audit(&app, auth.user.id, "images", "asset.admin_list", json!({})).await?;
     }
     let (limit, offset) = query.paging();
-    let rows=sqlx::query_scalar::<_,Value>("SELECT to_jsonb(a)-'object_key'-'thumbnail_key'||jsonb_build_object('model_display_name',t.model_snapshot->>'display_name','entry_format_id',t.entry_snapshot->>'id','prompt',t.request->>'prompt') FROM assets a JOIN tasks t ON t.id=a.task_id WHERE a.kind='result' AND ($1 OR a.user_id=$2) AND t.request->>'prompt' ILIKE $3 ORDER BY a.created_at DESC LIMIT $4 OFFSET $5").bind(all).bind(auth.user.id).bind(query.search()).bind(limit).bind(offset).fetch_all(&app.pool).await?;
+    let rows=sqlx::query_scalar::<_,Value>(&format!("SELECT to_jsonb(a)-'object_key'-'thumbnail_key'||jsonb_build_object('model_display_name',t.model_snapshot->>'display_name','entry_format_id',t.entry_snapshot->>'id','prompt',t.request->>'prompt','mode',t.mode,'reference_assets',{REFERENCE_VIEW}) FROM assets a JOIN tasks t ON t.id=a.task_id WHERE a.kind='result' AND ($1 OR a.user_id=$2) AND t.request->>'prompt' ILIKE $3 ORDER BY a.created_at DESC LIMIT $4 OFFSET $5")).bind(all).bind(auth.user.id).bind(query.search()).bind(limit).bind(offset).fetch_all(&app.pool).await?;
     Ok(Json(
         json!({"items":rows,"page":offset/limit+1,"per_page":limit,"has_more":rows.len()==limit as usize}),
     ))

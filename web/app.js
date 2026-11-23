@@ -1,4 +1,4 @@
-const state = { user: null, csrf: '', epoch: 0, route: '', formats: [], models: [], registryRevision: 0, activeTask: null, input: null, uploadPending: false, page: {}, rows: {}, poll: null, registryPoll: null, generationKey: '', generationBody: '', modelTest: false, generateLoad: 0 };
+const state = { user: null, csrf: '', epoch: 0, route: '', formats: [], models: [], registryRevision: 0, activeTask: null, references: [], legacyInput: null, imageInput: {}, uploadPending: false, page: {}, rows: {}, poll: null, registryPoll: null, generationKey: '', generationBody: '', modelTest: false, generateLoad: 0 };
 const pending = new WeakSet();
 const terminal = new Set(['succeeded', 'failed', 'submission_unknown', 'result_unavailable']);
 const statusNames = { queued: '排队中', preparing: '准备中', submitting: '等待上游', saving: '保存成果', succeeded: '已完成', failed: '失败', submission_unknown: '结果待确认', result_unavailable: '成果不可获取' };
@@ -91,16 +91,17 @@ function confirmAction(title, message, label, operation) {
 function resetPrivateState() {
   state.generateLoad += 1;
   state.epoch += 1; clearTimeout(state.poll); clearTimeout(state.registryPoll);
-  Object.assign(state, { user: null, csrf: '', models: [], formats: [], activeTask: null, input: null, rows: {}, page: {}, generationKey: '', generationBody: '', route: '', parentTask: null, uploadPending: false, modelTest: false });
+  Object.assign(state, { user: null, csrf: '', models: [], formats: [], activeTask: null, references: [], legacyInput: null, imageInput: {}, rows: {}, page: {}, generationKey: '', generationBody: '', route: '', parentTask: null, uploadPending: false, modelTest: false });
   all('[id$="-content"]').filter(target => target.id !== 'modal-content').forEach(target => target.replaceChildren());
   all('#app-shell form').forEach(form => form.reset());
   all('#app-shell input[type=search]').forEach(control => { control.value = ''; });
   for (const id of ['tasks-all', 'images-all', 'users-deleted']) { const control = find(`#${id}`); if (control) control.checked = false; }
   find('#prompt-count').textContent = '0 / 4000';
-  for (const id of ['entry-select', 'model-select', 'size-select', 'generation-progress']) find(`#${id}`).replaceChildren();
+  for (const id of ['entry-select', 'model-select', 'size-select', 'generation-progress', 'reference-list']) find(`#${id}`).replaceChildren();
+  renderGenerationModes(['t2i'], 't2i');
   for (const id of ['sidebar-name', 'sidebar-role', 'topbar-username', 'model-hint', 'entry-reason']) find(`#${id}`).textContent = '';
   for (const id of ['generate-error', 'global-error']) errorText(find(`#${id}`));
-  find('#upload-status').textContent = '上传一张真实原图，最多 25 MiB / 40 MP；实际限制以模型为准。';
+  find('#upload-status').textContent = '';
   delete find('#result-canvas').dataset.asset;
   find('#result-canvas').replaceChildren(node('div', { class: 'canvas-empty' }, node('h3', {}, '你的下一幅作品，从这里开始'), node('p', {}, '填写提示词并提交，结果会显示在这里。')));
   find('#generation-progress').hidden = true; find('#modal').close();
@@ -176,20 +177,21 @@ async function loadList(route, quiet = false) {
 }
 function renderTasks(target, items) {
   const active = items.filter(item => !terminal.has(item.status)).length; find('#active-count').textContent = active; find('#active-count').hidden = !active;
-  table(target, ['任务 / 提示词', '模型', '状态', '已耗时', '最近上游返回', '创建时间', '操作'], items.map(item => [node('div', {}, node('span', { class: 'cell-title' }, item.request.prompt.slice(0, 24)), node('span', { class: 'cell-sub' }, item.username || '本人')), item.model_display_name, taskBadge(item.status), node('span', { 'data-elapsed-id': item.id, 'data-elapsed-base': item.elapsed_ms, 'data-elapsed-clock': performance.now(), 'data-elapsed-live': String(!terminal.has(item.status)) }, duration(item.elapsed_ms)), badge(httpLabel(item.latest_upstream), item.latest_upstream?.http_status >= 400 ? 'error' : ''), timestamp(item.created_at), node('div', { class: 'row-actions' }, button('详情', () => taskDetail(item.id)), button('再次生成', () => again(item), 'subtle'))]));
+  table(target, ['任务 / 提示词', '模型', '状态', '已耗时', '最近上游返回', '创建时间', '操作'], items.map(item => [node('div', {}, node('span', { class: 'cell-title' }, item.request.prompt.slice(0, 24)), node('span', { class: 'cell-sub' }, `${item.username || '本人'} · ${modeLabel[item.mode || 't2i']}`), referenceStrip(item.reference_assets)), item.model_display_name, taskBadge(item.status), node('span', { 'data-elapsed-id': item.id, 'data-elapsed-base': item.elapsed_ms, 'data-elapsed-clock': performance.now(), 'data-elapsed-live': String(!terminal.has(item.status)) }, duration(item.elapsed_ms)), badge(httpLabel(item.latest_upstream), item.latest_upstream?.http_status >= 400 ? 'error' : ''), timestamp(item.created_at), node('div', { class: 'row-actions' }, button('详情', () => taskDetail(item.id)), button('再次生成', () => again(item), 'subtle'))]));
 }
 function renderImages(target, items) {
-  target.replaceChildren(node('div', { class: 'image-grid' }, items.map(item => node('article', { class: 'image-card' }, button(node('img', { src: `/api/v1/assets/${item.id}/preview?thumb=true`, alt: item.prompt || '生成结果', loading: 'lazy' }), () => imageDetail(item)), node('div', { class: 'image-card-content' }, node('strong', {}, item.model_display_name), node('p', {}, `${item.width} × ${item.height} · ${timestamp(item.created_at)}`), node('div', { class: 'row-actions' }, button('查看任务', () => taskDetail(item.task_id)), downloadButton(item.id)))))));
+  target.replaceChildren(node('div', { class: 'image-grid' }, items.map(item => node('article', { class: 'image-card' }, button(node('img', { src: `/api/v1/assets/${item.id}/preview?thumb=true`, alt: item.prompt || '生成结果', loading: 'lazy' }), () => imageDetail(item)), node('div', { class: 'image-card-content' }, node('strong', {}, item.model_display_name), node('p', {}, `${item.width} × ${item.height} · ${modeLabel[item.mode || 't2i']} · ${timestamp(item.created_at)}`), referenceStrip(item.reference_assets), node('div', { class: 'row-actions' }, button('查看任务', () => taskDetail(item.task_id)), downloadButton(item.id)))))));
 }
 function downloadButton(id) { return can('asset.download_own') ? node('a', { href: `/api/v1/assets/${id}/download`, class: 'button', download: '' }, '下载原图') : node('button', { type: 'button', disabled: true, title: '当前账号没有下载权限，请联系管理员' }, '无下载权限'); }
-function imageDetail(item) { dialog('图片预览', node('div', {}, node('img', { class: 'preview-large', src: `/api/v1/assets/${item.id}/preview`, alt: item.prompt || '生成结果' }), node('p', { class: 'muted' }, item.prompt || ''), node('p', { class: 'field-hint' }, `${item.width} × ${item.height} · ${item.mime || ''} · ${item.entry_format_id || ''}`)), [button('关联任务', () => taskDetail(item.task_id)), downloadButton(item.id)]); }
+function imageDetail(item) { dialog('图片预览', node('div', {}, node('img', { class: 'preview-large', src: `/api/v1/assets/${item.id}/preview`, alt: item.prompt || '生成结果' }), node('p', { class: 'muted' }, item.prompt || ''), node('p', { class: 'field-hint' }, `${item.width} × ${item.height} · ${item.mime || ''} · ${item.entry_format_id || ''}`), referenceStrip(item.reference_assets)), [button('关联任务', () => taskDetail(item.task_id)), downloadButton(item.id)]); }
 async function taskDetail(id) {
   const content = node('div'); loading(content); dialog('任务详情', content);
   try {
     const [result, upstream] = await Promise.all([api(`/tasks/${id}`), api(`/tasks/${id}/upstream-requests`)]);
     const task = result.task;
-    const pairs = [['任务 ID', task.id], ['状态', statusNames[task.status]], ['错误码', task.error_code], ['提示词', task.request.prompt], ['模型', task.model_display_name], ['创建时间', timestamp(task.created_at)], ['开始时间', timestamp(task.started_at)], ['结束时间', timestamp(task.ended_at)], ['排队耗时', duration(task.queue_ms)], ['执行耗时', duration(task.execution_ms)], ['总耗时', duration(task.total_ms ?? task.elapsed_ms)], ['显示时区', Intl.DateTimeFormat().resolvedOptions().timeZone], ['说明', task.message]];
+    const pairs = [['任务 ID', task.id], ['模式', modeLabel[task.mode || 't2i']], ['上游用量', task.usage ? Object.entries(task.usage).map(([key, amount]) => `${usageLabels[key]} ${amount}`).join(' · ') : '上游未提供'], ['状态', statusNames[task.status]], ['错误码', task.error_code], ['提示词', task.request.prompt], ['模型', task.model_display_name], ['创建时间', timestamp(task.created_at)], ['开始时间', timestamp(task.started_at)], ['结束时间', timestamp(task.ended_at)], ['排队耗时', duration(task.queue_ms)], ['执行耗时', duration(task.execution_ms)], ['总耗时', duration(task.total_ms ?? task.elapsed_ms)], ['显示时区', Intl.DateTimeFormat().resolvedOptions().timeZone], ['说明', task.message]];
     content.replaceChildren(node('dl', { class: 'detail-grid' }, pairs.flatMap(([name, value]) => [node('dt', {}, name), node('dd', {}, value || '—')])), node('h2', { class: 'section-divider' }, '上游通信记录'));
+    if (task.reference_assets?.length) content.prepend(node('section', {}, node('h2', { class: 'section-divider' }, '参考图'), referenceStrip(task.reference_assets)));
     if (!upstream.items.length) content.append(node('p', { class: 'field-hint' }, '尚未发起上游请求。'));
     for (const record of upstream.items) content.append(node('div', { class: 'notice' }, node('strong', {}, httpLabel(record)), node('p', {}, record.summary), node('small', {}, `${timestamp(record.started_at)} → ${timestamp(record.ended_at)} · ${duration(record.duration_ms)}${record.upstream_request_id ? ` · request ID: ${record.upstream_request_id}` : ''}`)));
     for (const asset of task.assets) content.append(node('img', { class: 'preview-large', src: `/api/v1/assets/${asset.id}/preview`, alt: '任务生成结果' }));
@@ -198,38 +200,89 @@ async function taskDetail(id) {
 }
 async function again(task) {
   if (!can('image.generate')) { toast('当前账号没有生成权限，请联系管理员'); return; }
-  const action = button('创建新的生成任务', async () => { find('#modal').close(); await navigate('/generate'); find('#prompt').value = task.request.prompt; find('#prompt').dispatchEvent(new Event('input')); state.parentTask = task.id; if (task.request.input_asset_ids?.length) toast('编辑任务需要重新上传原图；再次提交可能产生新的费用'); }, 'primary');
+  const action = button('创建新的生成任务', async () => {
+    find('#modal').close();
+    await navigate('/generate');
+    find('#prompt').value = task.request.prompt;
+    find('#prompt').dispatchEvent(new Event('input'));
+    const owned = task.user_id === state.user.id;
+    state.parentTask = owned ? task.id : null;
+    const entry = state.formats.find(item => item.id === task.entry_format_id);
+    const mode = task.mode === 'i2i' ? (entry?.image_input ? 'i2i' : 'legacy') : 't2i';
+    state.references = owned && mode === 'i2i'
+      ? (task.reference_assets || []).map(asset => ({ ...asset, weight: asset.weight ?? 0.75 })) : [];
+    state.legacyInput = owned && mode === 'legacy' ? task.reference_assets?.[0] : null;
+    await loadGenerate(false, mode, task.entry_format_id);
+    if (mode !== currentMode()) toast('原任务使用的生成模式当前不可用');
+  }, 'primary');
   dialog('再次生成', node('p', {}, '这会创建关联的新任务，可能产生新的上游调用费用。不会覆盖或自动重试原任务。'), [button('取消', () => find('#modal').close()), action]);
 }
-async function loadGenerate(preserve = true) {
+const modeLabel = { t2i: '文生图', i2i: '图生图', legacy: '旧版编辑' };
+const usageLabels = { input_tokens: '输入 token', output_tokens: '输出 token', total_tokens: '总 token' };
+const imageMimes = ['image/png', 'image/jpeg', 'image/webp'];
+const mebibyte = 1024 * 1024;
+const activeEntry = () => state.formats.find(item => item.id === find('#entry-select').value);
+const activeModel = () => state.models.find(item => item.id === find('#model-select').value);
+const currentMode = () => find('#generation-mode [aria-pressed="true"]').dataset.generationMode;
+function selectGenerationMode(mode) {
+  all('#generation-mode button').forEach(control => {
+    control.setAttribute('aria-pressed', String(control.dataset.generationMode === mode));
+  });
+}
+function renderGenerationModes(availableModes, mode) {
+  all('#generation-mode button').forEach(control => {
+    const value = control.dataset.generationMode;
+    control.disabled = !availableModes.includes(value);
+    if (value === 'legacy') control.hidden = control.disabled;
+  });
+  selectGenerationMode(mode);
+  const hint = find('#generation-mode-hint');
+  hint.hidden = !state.user || !can('image.generate') || availableModes.includes('i2i');
+  hint.textContent = hint.hidden ? '' : state.imageInput.enabled ? '暂无可用的图生图模型，请联系管理员。' : '管理员已关闭图生图。';
+}
+function entryMode(entry, enabled) {
+  if (entry.operation === 'generate') return 't2i';
+  if (!entry.image_input) return 'legacy';
+  return enabled ? 'i2i' : null;
+}
+async function loadGenerate(preserve = true, requestedMode = currentMode(), preferredEntry = '') {
   const load = ++state.generateLoad;
   const previousEntry = find('#entry-select').value;
   const previousModel = find('#model-select').value;
   const previousSize = find('#size-select').value;
   const formats = await api('/entry-formats');
   if (load !== state.generateLoad || state.route !== '/generate') return;
-  const selectedEntry = preserve && formats.items.some(item => item.id === previousEntry && item.available) ? previousEntry : formats.items.find(item => item.available)?.id || formats.items[0]?.id || '';
-  const models = await allItems(`/models?entry_format_id=${encodeURIComponent(selectedEntry)}`);
+  const query = new URLSearchParams(location.search);
+  const requestedModel = state.user.role === 'admin' ? query.get('model') : null;
+  const targetModel = requestedModel ? await api(`/admin/models/${requestedModel}`) : null;
   if (load !== state.generateLoad || state.route !== '/generate') return;
-  state.formats = formats.items; state.registryRevision = formats.registry_revision;
+  state.formats = formats.items;
+  state.registryRevision = formats.registry_revision;
+  state.imageInput = formats.image_input || {};
+  const enabled = state.imageInput.enabled && can('image.generate');
+  const availableModes = ['t2i', ...['i2i', 'legacy'].filter(mode => state.formats.some(entry => entry.available && entryMode(entry, enabled) === mode))];
+  const targetEntry = state.formats.find(entry => entry.id === targetModel?.entry_format_id);
+  const preferredMode = targetEntry ? entryMode(targetEntry, enabled) : requestedMode;
+  const mode = availableModes.includes(preferredMode) ? preferredMode : 't2i';
+  renderGenerationModes(availableModes, mode);
+  const entries = state.formats.filter(entry => entryMode(entry, enabled) === mode);
+  const preferred = targetModel?.entry_format_id || preferredEntry || (preserve ? previousEntry : '');
+  const selectedEntry = entries.find(entry => entry.id === preferred && entry.available)?.id || entries.find(entry => entry.available)?.id || '';
   const entrySelect = find('#entry-select');
-  entrySelect.replaceChildren(...state.formats.map(item => node('option', { value: item.id, disabled: !item.available }, item.name)));
+  entrySelect.replaceChildren(...entries.map(item => node('option', { value: item.id, disabled: !item.available }, item.name)));
   entrySelect.value = selectedEntry;
+  state.models = [];
+  renderReferences();
+  updateGenerateButton();
+  const models = selectedEntry ? await allItems(`/models?entry_format_id=${encodeURIComponent(selectedEntry)}`) : [];
+  if (load !== state.generateLoad || state.route !== '/generate') return;
   state.models = models;
-  renderModelChoices(preserve ? previousModel : '', previousSize);
+  state.modelTest = Boolean(targetModel && query.get('test') === '1');
+  renderModelChoices(requestedModel || (preserve && selectedEntry === previousEntry ? previousModel : ''), previousSize);
   const denied = !can('image.generate');
   find('#generation-denied').hidden = !denied;
   find('#generation-denied').textContent = '当前账号没有生成权限，请联系管理员';
   updateGenerateButton();
-  const requestedModel = new URLSearchParams(location.search).get('model');
-  if (requestedModel && state.user.role === 'admin' && !state.modelTest) {
-    state.modelTest = new URLSearchParams(location.search).get('test') === '1';
-    const model = await api(`/admin/models/${requestedModel}`);
-    if (load !== state.generateLoad || state.route !== '/generate') return;
-    if (entrySelect.value !== model.entry_format_id) { const models = await allItems(`/models?entry_format_id=${encodeURIComponent(model.entry_format_id)}`); if (load !== state.generateLoad || state.route !== '/generate') return; entrySelect.value = model.entry_format_id; state.models = models; }
-    renderModelChoices(requestedModel);
-    toast(state.modelTest ? '真实测试可能计费。请确认参数与原图后主动提交。' : '已选择模型');
-  }
   if (state.activeTask) await pollActiveTask();
 }
 function renderModelChoices(previous = '', size = '') {
@@ -238,8 +291,6 @@ function renderModelChoices(previous = '', size = '') {
   if (state.models.some(item => item.id === previous)) control.value = previous;
   if (!state.models.length) control.append(node('option', { value: '' }, '暂无可用模型，请联系管理员'));
   if (previous && !state.models.some(item => item.id === previous)) { control.prepend(node('option', { value: '' }, '原模型已失效，请重新选择')); control.value = ''; errorText(find('#generate-error'), '模型或入口已失效，请确认后重新选择；提示词草稿已保留。'); }
-  const entry = state.formats.find(item => item.id === find('#entry-select').value);
-  find('#input-image-field').hidden = entry?.operation !== 'edit';
   find('#entry-reason').textContent = state.models.length ? '' : '暂无可用模型，请联系管理员';
   renderSizes(size);
 }
@@ -249,24 +300,137 @@ function renderSizes(previous = '') {
   if (model?.capabilities.sizes.includes(previous)) find('#size-select').value = previous;
   else if (model?.capabilities.sizes.includes(model.defaults?.size)) find('#size-select').value = model.defaults.size;
   find('#model-hint').textContent = model ? `已授权 · 配置版本 ${model.revision}` : '只有启用且获授权的模型配置会显示在这里。';
+  renderReferences();
   updateGenerateButton();
 }
 function updateGenerateButton() {
   const control = find('#generate-submit');
   if (pending.has(find('#generate-form'))) return;
-  control.disabled = !can('image.generate') || !state.models.length || !find('#model-select').value || state.uploadPending;
-  control.textContent = state.modelTest ? '执行真实测试（可能计费）' : '开始生成';
+  const reason = generationBlocker();
+  control.disabled = Boolean(reason);
+  find('#generation-hint').textContent = reason || '图片由服务器保存 · 关闭页面不会取消任务';
+  control.textContent = state.modelTest ? '执行真实测试（可能计费）' : currentMode() === 'i2i' ? '开始图生图' : '开始生成';
 }
-async function uploadInput(event) {
-  if (state.uploadPending) { event.target.value = ''; return; }
-  const file = event.target.files[0]; state.input = null;
-  if (!file) return;
-  const model = state.models.find(item => item.id === find('#model-select').value);
-  if (file.size > Math.min(26214400, model?.capabilities.max_input_bytes || 26214400)) { errorText(find('#generate-error'), '图片超过平台或模型体积上限'); event.target.value = ''; return; }
-  state.uploadPending = true; updateGenerateButton(); find('#upload-status').textContent = '正在上传并校验原图…';
-  try { const data = new FormData(); data.append('image', file); state.input = await api('/assets/inputs', { method: 'POST', body: data }); find('#upload-status').textContent = `原图已校验 · ${state.input.width} × ${state.input.height} · ${state.input.mime}`; errorText(find('#generate-error')); }
-  catch (failure) { if (!failure.cancelled) { errorText(find('#generate-error'), failure.message); find('#upload-status').textContent = '上传失败，请重新选择图片重试。'; } }
-  finally { state.uploadPending = false; updateGenerateButton(); }
+function referenceLimit(mode = currentMode()) {
+  const modelLimit = activeModel()?.capabilities.max_input_bytes || 25 * mebibyte;
+  if (mode === 'legacy') return Math.min(modelLimit, 25 * mebibyte);
+  return Math.min(modelLimit, activeEntry()?.image_input?.max_bytes || 0, state.imageInput.max_bytes || 0);
+}
+function referenceCompatible(asset, mode = currentMode()) {
+  const capabilities = activeModel()?.capabilities;
+  return asset.byte_size <= referenceLimit(mode) && capabilities?.input_mimes?.includes(asset.mime)
+    && asset.width * asset.height <= (capabilities.max_pixels || 40000000);
+}
+function generationBlocker() {
+  if (!can('image.generate')) return '当前账号没有生成权限';
+  if (!activeModel() || !find('#size-select').value) return '请选择一个可用模型和输出尺寸';
+  if (state.uploadPending) return '正在校验参考图';
+  if (!find('#prompt').value.trim()) return '请输入提示词';
+  const mode = currentMode();
+  if (mode === 't2i') return '';
+  const items = mode === 'legacy' ? (state.legacyInput ? [state.legacyInput] : []) : state.references;
+  if (!items.length) return '请先添加参考图';
+  if (items.length > (activeEntry()?.image_input?.max_count || 1)) return '参考图数量超过当前入口上限';
+  if (items.some(item => !referenceCompatible(item, mode))) return '有参考图不符合当前模型的格式、体积或像素限制';
+  return '';
+}
+function thumbnail(asset, alt = '参考图') {
+  return node('img', { src: `/api/v1/assets/${asset.id}/preview?thumb=true`, alt, loading: 'lazy' });
+}
+function referenceStrip(items = []) {
+  if (!items.length) return null;
+  return node('div', { class: 'reference-strip', 'aria-label': '参考图' }, items.map(asset => {
+    const details = asset.weight == null ? `${asset.width} × ${asset.height}` : `强度 ${asset.weight.toFixed(2)}`;
+    return node('figure', {}, thumbnail(asset), node('figcaption', {}, details));
+  }));
+}
+function renderReferences() {
+  const mode = currentMode();
+  const config = activeEntry()?.image_input;
+  const legacy = mode === 'legacy';
+  const visible = can('image.generate') && (legacy || (mode === 'i2i' && Boolean(config)));
+  find('#input-image-field').hidden = !visible;
+  find('#input-image').multiple = !legacy;
+  find('#input-image').disabled = !visible || state.uploadPending;
+  find('#reference-library').hidden = legacy;
+  find('#reference-library').disabled = !activeModel() || state.uploadPending || state.references.length >= (config?.max_count || 0);
+  if (!visible) { find('#reference-list').replaceChildren(); return; }
+  find('#upload-status').textContent = state.uploadPending ? '正在上传并校验参考图…' :
+    `可拖拽、粘贴或选择 PNG、JPEG、WebP。单张上限 ${(referenceLimit() / mebibyte).toFixed(2)} MiB，最多 ${config?.max_count || 1} 张。`;
+  const items = legacy ? (state.legacyInput ? [state.legacyInput] : []) : state.references;
+  const changeOrder = (index, offset) => {
+    const target = index + offset;
+    if (target < 0 || target >= items.length) return;
+    [items[index], items[target]] = [items[target], items[index]];
+    renderReferences();
+    find(`#reference-${offset < 0 ? 'up' : 'down'}-${target}`)?.focus();
+  };
+  find('#reference-list').replaceChildren(...items.map((asset, index) => {
+    const value = node('output', {}, (asset.weight ?? 0.75).toFixed(2));
+    const slider = config?.accepts_weights ? node('label', { class: 'reference-weight' }, '强度 ', value,
+      node('input', { type: 'range', min: '0', max: '1', step: '0.01', value: asset.weight ?? 0.75, 'aria-label': `参考图 ${index + 1} 强度`,
+        onInput: event => { asset.weight = Number(event.target.value); value.value = asset.weight.toFixed(2); } })) : null;
+    const move = (offset, label, direction) => node('button', { id: `reference-${direction}-${index}`, type: 'button', 'aria-label': label,
+      disabled: index + offset < 0 || index + offset >= items.length, onClick: () => changeOrder(index, offset) }, label);
+    const remove = button('移除', () => {
+      if (legacy) state.legacyInput = null;
+      else state.references.splice(index, 1);
+      renderReferences();
+      updateGenerateButton();
+    });
+    return node('li', { class: 'reference-item' }, thumbnail(asset, `参考图 ${index + 1}`),
+      node('div', {}, node('span', {}, `${asset.width} × ${asset.height} · ${asset.mime}`), slider,
+        node('div', { class: 'row-actions' }, !legacy && items.length > 1 ? [move(-1, '上移', 'up'), move(1, '下移', 'down')] : null, remove)));
+  }));
+}
+async function uploadReferences(files) {
+  const mode = currentMode();
+  if (state.uploadPending || find('#input-image-field').hidden || !files.length || !activeModel()) return;
+  const legacy = mode === 'legacy';
+  const count = legacy ? 1 : (activeEntry()?.image_input?.max_count || 0) - state.references.length;
+  const error = find('#generate-error');
+  if (files.length > count) { errorText(error, `当前还可添加 ${Math.max(0, count)} 张参考图`); return; }
+  if (files.some(file => !imageMimes.includes(file.type))) { errorText(error, '仅支持 PNG、JPEG 和 WebP'); return; }
+  if (files.some(file => !file.size || file.size > referenceLimit(mode))) { errorText(error, '参考图为空或超过单张大小上限'); return; }
+  const epoch = state.epoch;
+  state.uploadPending = true;
+  renderReferences();
+  updateGenerateButton();
+  errorText(error);
+  try {
+    for (const file of files) {
+      const data = new FormData();
+      data.append('image', file);
+      const asset = await api(legacy ? '/assets/inputs' : '/images/reference', { method: 'POST', body: data });
+      if (legacy) state.legacyInput = asset;
+      else state.references.push({ ...asset, weight: 0.75 });
+    }
+  } catch (failure) {
+    if (!failure.cancelled) errorText(error, failure.message);
+  } finally {
+    if (state.epoch === epoch) { state.uploadPending = false; renderReferences(); updateGenerateButton(); }
+  }
+}
+async function referenceLibrary(page = 1, content = null) {
+  if (!content) {
+    content = node('div');
+    dialog('从图片记录选择', content, [button('完成', () => find('#modal').close())]);
+  }
+  loading(content);
+  try {
+    const result = await api(`/images?page=${page}&per_page=12`);
+    const choices = result.items.map(asset => {
+      const selected = state.references.some(reference => reference.id === asset.id);
+      const usable = referenceCompatible(asset);
+      return node('button', { type: 'button', class: 'reference-choice', disabled: selected || !usable || state.references.length >= activeEntry()?.image_input?.max_count,
+        onClick: () => { state.references.push({ ...asset, weight: 0.75 }); renderReferences(); updateGenerateButton(); find('#modal').close(); } },
+      thumbnail(asset, asset.prompt || '生成图'), node('span', {}, selected ? '已选择' : usable ? `${asset.width} × ${asset.height}` : '与当前模型不兼容'));
+    });
+    content.replaceChildren(choices.length ? node('div', { class: 'reference-library-grid' }, choices) : node('p', {}, '暂无可用的生成图'),
+      node('div', { class: 'pagination' }, page > 1 ? button('上一页', () => referenceLibrary(page - 1, content)) : null, result.has_more ? button('下一页', () => referenceLibrary(page + 1, content)) : null));
+  } catch (failure) {
+    if (!failure.cancelled) empty(content, '无法加载图片', failure.message, () => referenceLibrary(page, content));
+  }
 }
 async function submitGeneration(event) {
   event.preventDefault();
@@ -274,11 +438,18 @@ async function submitGeneration(event) {
     errorText(find('#generate-error'));
     try {
       if (!can('image.generate')) throw new Error('当前账号没有生成权限，请联系管理员');
-      const model = state.models.find(item => item.id === find('#model-select').value);
-      const entry = state.formats.find(item => item.id === find('#entry-select').value);
-      if (!model || !entry) throw new Error('暂无可用模型，请联系管理员');
-      if (entry.operation === 'edit' && !state.input) throw new Error('请先上传并校验一张原图');
-      const body = { entry_format_id: entry.id, model_config_id: model.id, model_revision: model.revision, registry_revision: state.registryRevision, prompt: find('#prompt').value, input_asset_ids: entry.operation === 'edit' ? [state.input.id] : [], output: { size: find('#size-select').value, count: 1 } };
+      const reason = generationBlocker();
+      if (reason) throw new Error(reason);
+      const model = activeModel();
+      const entry = activeEntry();
+      const mode = currentMode();
+      const body = { entry_format_id: entry.id, model_config_id: model.id, model_revision: model.revision, registry_revision: state.registryRevision, prompt: find('#prompt').value, output: { size: find('#size-select').value, count: 1 } };
+      if (mode === 'i2i') {
+        body.mode = 'i2i';
+        body.references = state.references.map(asset => entry.image_input.accepts_weights ? { id: asset.id, weight: asset.weight ?? 0.75 } : { id: asset.id });
+      } else if (mode === 'legacy') {
+        body.input_asset_ids = [state.legacyInput.id];
+      }
       if (state.parentTask) body.parent_task_id = state.parentTask;
       const serialized = JSON.stringify(body);
       if (state.generationBody !== serialized) { state.generationBody = serialized; state.generationKey = crypto.randomUUID(); }
@@ -380,6 +551,27 @@ async function pluginForm(existing) {
     }, '保存待刷新');
   } catch (failure) { if (!failure.cancelled) toast(failure.message); }
 }
+async function imageInputSettings() {
+  try {
+    const settings = await api('/admin/settings');
+    formDialog('图生图设置', [
+      node('label', { class: 'checkbox-label' }, input('enabled', 'true', { type: 'checkbox', checked: settings.enabled }), '启用图生图'),
+      field('单张上传上限（MiB）', input('max_mib', settings.max_bytes / mebibyte,
+        { type: 'number', min: '0.25', max: '25', step: 'any', required: true })),
+    ], async form => {
+      const formData = new FormData(form);
+      await api('/admin/settings', { method: 'PATCH', body: JSON.stringify({
+        revision: settings.revision,
+        enabled: formData.has('enabled'),
+        max_bytes: Math.round(Number(formData.get('max_mib')) * mebibyte),
+      }) });
+      find('#modal').close();
+      toast('图生图设置已保存');
+    });
+  } catch (failure) {
+    if (!failure.cancelled) toast(failure.message);
+  }
+}
 function themeState() { const preference = document.documentElement.dataset.themePreference || 'system'; all('[data-theme-value]').forEach(control => control.setAttribute('aria-pressed', String(control.dataset.themeValue === preference))); }
 function bindEvents() {
   find('#login-form').addEventListener('submit', event => {
@@ -409,14 +601,54 @@ function bindEvents() {
     if (event.target.closest('#new-user')) userForm();
     if (event.target.closest('#new-model')) modelForm();
     if (event.target.closest('#install-plugin')) installPlugin();
+    if (event.target.closest('#image-input-settings')) imageInputSettings();
   });
   all('input[type=search]').forEach(control => { let timer; control.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { state.page[state.route] = 1; loadList(state.route); }, 300); }); });
   for (const id of ['tasks-all', 'images-all']) find(`#${id}`).addEventListener('change', () => { state.page[state.route] = 1; loadList(state.route); });
   document.addEventListener('change', event => { if (event.target.id === 'users-deleted') { state.page[state.route] = 1; loadList(state.route); } });
-  find('#entry-select').addEventListener('change', async () => { const load = ++state.generateLoad; const entry = find('#entry-select').value; state.input = null; find('#input-image').value = ''; errorText(find('#generate-error')); try { const models = await allItems(`/models?entry_format_id=${encodeURIComponent(entry)}`); if (load !== state.generateLoad || state.route !== '/generate') return; state.models = models; renderModelChoices(); } catch (failure) { if (!failure.cancelled) errorText(find('#generate-error'), failure.message); } });
+  const changeGenerationSelection = async () => {
+    if (location.search) history.replaceState({}, '', '/generate');
+    state.models = [];
+    errorText(find('#generate-error'));
+    updateGenerateButton();
+    try { await loadGenerate(); }
+    catch (failure) { if (!failure.cancelled) errorText(find('#generate-error'), failure.message); }
+  };
+  all('#generation-mode button').forEach(control => control.addEventListener('click', () => {
+    const mode = control.dataset.generationMode;
+    if (mode === currentMode()) return;
+    selectGenerationMode(mode);
+    changeGenerationSelection();
+  }));
+  find('#entry-select').addEventListener('change', changeGenerationSelection);
   find('#model-select').addEventListener('change', () => { state.generateLoad += 1; errorText(find('#generate-error')); renderSizes(); });
-  find('#input-image').addEventListener('change', uploadInput);
-  find('#prompt').addEventListener('input', event => { find('#prompt-count').textContent = `${[...event.target.value].length} / 4000`; });
+  find('#input-image').addEventListener('change', event => {
+    const files = [...event.currentTarget.files];
+    event.currentTarget.value = '';
+    uploadReferences(files);
+  });
+  const drop = find('#reference-drop');
+  drop.addEventListener('dragover', event => {
+    if (!event.dataTransfer?.types.includes('Files')) return;
+    event.preventDefault();
+    drop.classList.add('drag-over');
+  });
+  drop.addEventListener('dragleave', event => { if (!drop.contains(event.relatedTarget)) drop.classList.remove('drag-over'); });
+  drop.addEventListener('drop', event => {
+    event.preventDefault();
+    drop.classList.remove('drag-over');
+    uploadReferences([...(event.dataTransfer?.files || [])]);
+  });
+  document.addEventListener('paste', event => {
+    if (state.route !== '/generate' || find('#input-image-field').hidden || find('#modal').open || !event.clipboardData?.files.length) return;
+    event.preventDefault();
+    uploadReferences([...event.clipboardData.files]);
+  });
+  find('#reference-library').addEventListener('click', () => referenceLibrary());
+  find('#prompt').addEventListener('input', event => {
+    find('#prompt-count').textContent = `${[...event.target.value].length} / 4000`;
+    updateGenerateButton();
+  });
   find('#generate-form').addEventListener('submit', submitGeneration);
   find('#account-form').addEventListener('submit', event => { event.preventDefault(); busy(event.currentTarget, async () => { errorText(find('#account-error')); try { const result = await api('/me', { method: 'PATCH', body: JSON.stringify({ display_name: find('#account-display').value, revision: state.user.revision }) }); await identity({ user: result.user, csrf_token: state.csrf }); toast('账号资料已保存'); } catch (failure) { if (!failure.cancelled) errorText(find('#account-error'), failure.message); } }); });
   window.addEventListener('popstate', () => { if (state.user) loadPage(); else goLogin(); });
@@ -428,7 +660,15 @@ function registryWatch() {
   clearTimeout(state.registryPoll);
   if (!state.user) return;
   state.registryPoll = setTimeout(async () => {
-    try { await identity(await api('/auth/me')); if (state.route === '/generate') { const result = await api('/entry-formats'); if (result.registry_revision !== state.registryRevision) { await loadGenerate(); toast('入口注册表已更新；仍有效的创作草稿已保留'); } } }
+    try {
+      await identity(await api('/auth/me'));
+      if (state.route === '/generate') {
+        const result = await api('/entry-formats');
+        if (result.registry_revision !== state.registryRevision || result.image_input?.enabled !== state.imageInput.enabled || result.image_input?.max_bytes !== state.imageInput.max_bytes) {
+          await loadGenerate();
+        }
+      }
+    }
     catch (failure) { if (!failure.cancelled && state.user) errorText(find('#global-error'), failure.message); }
     registryWatch();
   }, 15000);

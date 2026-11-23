@@ -10,6 +10,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use sqlx::Row;
 use std::{
+    io::Cursor,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -280,8 +281,10 @@ async fn process(app: &App, id: Uuid) -> ApiResult<()> {
         };
         mapped.insert(name.clone(), value);
     }
-    let mut builder = client.post(target);
-    if entry.definition["request"]["encoding"] == "json" {
+    let mut builder = client.post(target.clone());
+    if request["mode"] == "i2i" {
+        builder = with_references(app, id, owner, &entry, &target, builder, mapped).await?;
+    } else if entry.definition["request"]["encoding"] == "json" {
         builder = builder.json(&mapped);
     } else {
         let mut form = reqwest::multipart::Form::new();
@@ -351,6 +354,9 @@ async fn process(app: &App, id: Uuid) -> ApiResult<()> {
     if paused == true {
         sqlx::query("UPDATE tasks SET status='queued',message='恢复核对模式暂停外部生成',lease_until=NULL,lease_token=NULL WHERE id=$1").bind(id).execute(&app.pool).await?;
         return Err(ApiError::conflict("GENERATION_PAUSED", "外部生成已暂停"));
+    }
+    if request["mode"] == "i2i" {
+        storage::require_reference_enabled(&storage::reference_settings(app).await?)?;
     }
     let record_id = record(app, id, "submit").await?;
     let started = Instant::now();
@@ -461,6 +467,167 @@ fn text_url(model: &Value) -> ApiResult<&str> {
         .as_str()
         .ok_or_else(|| ApiError::validation("模型地址快照损坏"))
 }
+
+async fn with_references(
+    app: &App,
+    task: Uuid,
+    owner: Uuid,
+    entry: &Entry,
+    target: &Url,
+    builder: reqwest::RequestBuilder,
+    mut fields: Map<String, Value>,
+) -> ApiResult<reqwest::RequestBuilder> {
+    let input = entry
+        .image_input()
+        .ok_or_else(|| ApiError::validation("当前入口不支持图生图"))?;
+    let request = &entry.definition["request"];
+    let mapping = &request["reference_images"];
+    let encoding = mapping["encoding"].as_str().unwrap_or("multipart");
+    let field = mapping["field"]
+        .as_str()
+        .or_else(|| request["files"][0]["field"].as_str())
+        .ok_or_else(|| ApiError::validation("入口缺少参考图映射"))?;
+    let rows = sqlx::query(
+        "SELECT a.id,a.object_key,a.kind,a.mime,r.weight FROM task_reference_assets r
+         JOIN assets a ON a.id=r.asset_id WHERE r.task_id=$1 AND a.user_id=$2 ORDER BY r.position",
+    )
+    .bind(task)
+    .bind(owner)
+    .fetch_all(&app.pool)
+    .await?;
+    if rows.is_empty() || rows.len() > usize::from(input.max_count) {
+        return Err(ApiError::validation("任务参考图缺失或超出入口限制"));
+    }
+    if let Some(weights_field) = mapping["weights_field"].as_str() {
+        let weights: Vec<f64> = rows.iter().map(|row| row.get("weight")).collect();
+        fields.insert(weights_field.into(), json!(weights));
+    }
+
+    if encoding == "url" {
+        let loopback_mock = target.scheme() == "http" && target.host_str() == Some("127.0.0.1");
+        if !app.config.origin.starts_with("https://") && !loopback_mock {
+            return Err(ApiError::validation(
+                "签名参考图地址需要可供上游访问的 HTTPS PUBLIC_ORIGIN",
+            ));
+        }
+        let mut links = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key: &str = row.get("object_key");
+            if !tokio::fs::try_exists(app.config.data_dir.join(key)).await? {
+                return Err(ApiError::validation("参考图文件已丢失"));
+            }
+            links.push(storage::signed_reference(app, task, row.get("id"))?);
+        }
+        fields.insert(field.into(), json!(links));
+        return Ok(builder.json(&fields));
+    }
+
+    let mut form = reqwest::multipart::Form::new();
+    let mut encoded = Vec::with_capacity(rows.len());
+    let mut total = 0;
+    for (position, row) in rows.into_iter().enumerate() {
+        let mime: String = row.get("mime");
+        let bytes = storage::object_bytes(
+            app,
+            row.get("object_key"),
+            row.get::<&str, _>("kind") == "reference",
+        )
+        .await
+        .map_err(|_| ApiError::validation("任务参考图无法读取"))?;
+        let (bytes, mime) = if mapping["flatten_alpha"] == true {
+            flatten_reference(app, bytes, mime).await?
+        } else {
+            (bytes, mime)
+        };
+        if bytes.len() > input.max_bytes {
+            return Err(ApiError::validation("转换后的参考图超过入口限制"));
+        }
+        total += bytes.len();
+        if encoding == "base64" {
+            if total > storage::MAX_IMAGE {
+                return Err(ApiError::validation(
+                    "Base64 参考图原始总大小不得超过 25 MiB",
+                ));
+            }
+            encoded.push(STANDARD.encode(bytes));
+        } else {
+            let extension = match mime.as_str() {
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                _ => "png",
+            };
+            form = form.part(
+                field.to_owned(),
+                reqwest::multipart::Part::bytes(bytes)
+                    .file_name(format!("reference-{}.{extension}", position + 1))
+                    .mime_str(&mime)
+                    .map_err(|_| ApiError::validation("参考图格式无效"))?,
+            );
+        }
+    }
+    if encoding == "base64" {
+        fields.insert(field.into(), json!(encoded));
+        Ok(builder.json(&fields))
+    } else {
+        for (name, value) in fields {
+            form = form.text(
+                name,
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string()),
+            );
+        }
+        Ok(builder.multipart(form))
+    }
+}
+
+async fn flatten_reference(
+    app: &App,
+    bytes: Vec<u8>,
+    mime: String,
+) -> ApiResult<(Vec<u8>, String)> {
+    let permit = app
+        .image_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::validation("图片处理已关闭"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let decoded =
+            image::load_from_memory(&bytes).map_err(|_| ApiError::validation("无法解码参考图"))?;
+        if !decoded.color().has_alpha() {
+            return Ok((bytes, mime));
+        }
+        let rgba = decoded.into_rgba8();
+        let rgb = image::RgbImage::from_fn(rgba.width(), rgba.height(), |column, row| {
+            let pixel = rgba.get_pixel(column, row);
+            let alpha = u16::from(pixel[3]);
+            let blend = |channel: usize| {
+                ((u16::from(pixel[channel]) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+            };
+            image::Rgb([blend(0), blend(1), blend(2)])
+        });
+        let mut output = Cursor::new(Vec::new());
+        rgb.write_to(&mut output, image::ImageFormat::Png)
+            .map_err(|_| ApiError::validation("无法编码参考图"))?;
+        Ok((output.into_inner(), "image/png".into()))
+    })
+    .await
+    .map_err(|_| ApiError::validation("无法转换参考图"))?
+}
+
+fn token_usage(value: &Value) -> Option<Value> {
+    let mut usage = Map::new();
+    for field in ["input_tokens", "output_tokens", "total_tokens"] {
+        if let Some(amount) = value[field].as_u64() {
+            usage.insert(field.into(), json!(amount));
+        }
+    }
+    (!usage.is_empty()).then_some(Value::Object(usage))
+}
+
 async fn save_receipt(
     app: &App,
     id: Uuid,
@@ -471,6 +638,7 @@ async fn save_receipt(
     content_type: &str,
 ) -> ApiResult<()> {
     let response = &entry.definition["response"];
+    let mut usage = None;
     let image = if response["encoding"] == "binary" {
         if !content_type.starts_with("image/") {
             return Err(ApiError::validation("二进制回执不是图片 Content-Type"));
@@ -479,6 +647,12 @@ async fn save_receipt(
     } else {
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| ApiError::validation("上游 HTTP 成功但响应不是有效 JSON"))?;
+        let pointer = response["usage_pointer"]
+            .as_str()
+            .or_else(|| entry.installation_id.is_none().then_some("/usage"));
+        usage = pointer
+            .and_then(|pointer| value.pointer(pointer))
+            .and_then(token_usage);
         if response["error_pointer"]
             .as_str()
             .and_then(|pointer| value.pointer(pointer))
@@ -535,6 +709,13 @@ async fn save_receipt(
             _ => return Err(ApiError::validation("不支持的图片来源")),
         }
     };
+    if let Some(usage) = usage {
+        sqlx::query("UPDATE tasks SET usage=$1 WHERE id=$2")
+            .bind(usage)
+            .bind(id)
+            .execute(&app.pool)
+            .await?;
+    }
     storage::save(app, owner, Some(id), "result", image).await?;
     Ok(())
 }

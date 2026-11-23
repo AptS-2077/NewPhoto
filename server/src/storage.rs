@@ -10,6 +10,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use image::{GenericImageView, ImageFormat, ImageReader};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,8 +21,48 @@ use uuid::Uuid;
 
 pub const MAX_IMAGE: usize = 25 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 40_000_000;
+const REFERENCE_QUOTA: i64 = 100 * 1024 * 1024;
+const REFERENCE_LINK_PURPOSE: &[u8] = b"reference-link";
+
+pub async fn reference_settings(app: &App) -> ApiResult<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key='image_input_settings'")
+            .fetch_one(&app.pool)
+            .await?,
+    )
+}
+
+pub fn require_reference_enabled(settings: &Value) -> ApiResult<()> {
+    if settings["enabled"] == true {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "IMAGE_INPUT_DISABLED",
+            "管理员已关闭图生图",
+        ))
+    }
+}
+
+fn reference_storage_error() -> ApiError {
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "REFERENCE_UNAVAILABLE",
+        "参考图无法读取或解密",
+    )
+}
 
 pub async fn cleanup_unreferenced(app: &App) -> ApiResult<()> {
+    let mut transaction = app.pool.begin().await?;
+    let candidates = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM assets WHERE kind='reference' AND created_at < now()-interval '24 hours'
+         AND NOT EXISTS (SELECT 1 FROM task_reference_assets WHERE asset_id=assets.id)
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM assets WHERE id=ANY($1) AND NOT EXISTS (SELECT 1 FROM task_reference_assets WHERE asset_id=assets.id)")
+        .bind(&candidates).execute(&mut *transaction).await?;
+    transaction.commit().await?;
     for directory in ["images", "thumbnails", "receipts", "plugins"] {
         let mut entries = tokio::fs::read_dir(app.config.data_dir.join(directory)).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -77,6 +118,17 @@ pub async fn save(
     kind: &str,
     bytes: Vec<u8>,
 ) -> ApiResult<Value> {
+    save_image(app, user_id, task_id, kind, bytes, None).await
+}
+
+async fn save_image(
+    app: &App,
+    user_id: Uuid,
+    task_id: Option<Uuid>,
+    kind: &str,
+    bytes: Vec<u8>,
+    declared_mime: Option<String>,
+) -> ApiResult<Value> {
     if bytes.is_empty() || bytes.len() > MAX_IMAGE {
         return Err(ApiError::validation("图片必须介于 1 字节和 25 MiB 之间"));
     }
@@ -97,6 +149,9 @@ pub async fn save(
                 ImageFormat::WebP => "image/webp",
                 _ => return Err(ApiError::validation("仅支持 PNG/JPEG/WebP")),
             };
+            if declared_mime.is_some_and(|declared| declared != mime) {
+                return Err(ApiError::validation("上传声明的图片类型与真实内容不符"));
+            }
             let (width, height) = ImageReader::with_format(Cursor::new(&bytes), format)
                 .into_dimensions()
                 .map_err(|_| ApiError::validation("无法读取图片尺寸"))?;
@@ -121,14 +176,228 @@ pub async fn save(
         .await
         .map_err(|_| ApiError::validation("图片处理失败"))??;
     let id = Uuid::new_v4();
-    let key = format!("images/{id}.bin");
-    let thumbnail_key = format!("thumbnails/{id}.png");
-    atomic_write(app, &key, &bytes).await?;
-    atomic_write(app, &thumbnail_key, &thumbnail).await?;
-    sqlx::query("INSERT INTO assets(id,user_id,task_id,kind,object_key,thumbnail_key,digest,mime,width,height,byte_size) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(id).bind(user_id).bind(task_id).bind(kind).bind(&key).bind(&thumbnail_key).bind(hash(&bytes)).bind(mime).bind(width as i32).bind(height as i32).bind(bytes.len() as i64).execute(&app.pool).await?;
-    Ok(
-        json!({"id":id,"mime":mime,"width":width,"height":height,"byte_size":bytes.len(),"preview_url":format!("/api/v1/assets/{id}/preview"),"download_url":format!("/api/v1/assets/{id}/download")}),
+    let mut transaction = app.pool.begin().await?;
+    let reference = kind == "reference";
+    if reference {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,734205))")
+            .bind(user_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        let settings: Value = sqlx::query_scalar(
+            "SELECT value FROM app_settings WHERE key='image_input_settings' FOR SHARE",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        require_reference_enabled(&settings)?;
+        if bytes.len() as u64 > settings["max_bytes"].as_u64().unwrap_or(0) {
+            return Err(ApiError::validation("图片超过管理员设置的单张上传上限"));
+        }
+        let used: i64 = sqlx::query_scalar("SELECT COALESCE(sum(byte_size),0)::bigint FROM assets WHERE user_id=$1 AND kind='reference'")
+            .bind(user_id).fetch_one(&mut *transaction).await?;
+        if used + bytes.len() as i64 > REFERENCE_QUOTA {
+            return Err(ApiError::conflict(
+                "REFERENCE_QUOTA",
+                "已达到 100 MiB 参考图上传配额",
+            ));
+        }
+    }
+    let key = if reference {
+        format!("images/reference-{id}.bin")
+    } else {
+        format!("images/{id}.bin")
+    };
+    let thumbnail_key = if reference {
+        format!("thumbnails/reference-{id}.bin")
+    } else {
+        format!("thumbnails/{id}.png")
+    };
+    let byte_size = bytes.len();
+    let digest = hash(&bytes);
+    let (object, preview) = if reference {
+        let config = app.config.clone();
+        let object_purpose = key.clone();
+        let thumbnail_purpose = thumbnail_key.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>((
+                config.seal(object_purpose.as_bytes(), &bytes)?,
+                config.seal(thumbnail_purpose.as_bytes(), &thumbnail)?,
+            ))
+        })
+        .await
+        .map_err(|_| reference_storage_error())?
+        .map_err(|_| reference_storage_error())?
+    } else {
+        (bytes, thumbnail)
+    };
+    atomic_write(app, &key, &object).await?;
+    atomic_write(app, &thumbnail_key, &preview).await?;
+    sqlx::query("INSERT INTO assets(id,user_id,task_id,kind,object_key,thumbnail_key,digest,mime,width,height,byte_size) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+        .bind(id).bind(user_id).bind(task_id).bind(kind).bind(key).bind(thumbnail_key).bind(digest)
+        .bind(mime).bind(width as i32).bind(height as i32).bind(byte_size as i64).execute(&mut *transaction).await?;
+    transaction.commit().await?;
+    Ok(asset_info(id, mime, width, height, byte_size))
+}
+
+fn asset_info(id: Uuid, mime: &str, width: u32, height: u32, size: usize) -> Value {
+    json!({"id":id,"mime":mime,"width":width,"height":height,"byte_size":size,"preview_url":format!("/api/v1/assets/{id}/preview"),"download_url":format!("/api/v1/assets/{id}/download")})
+}
+
+struct StagedReference(std::path::PathBuf);
+impl Drop for StagedReference {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+pub async fn upload_reference(
+    State(app): State<App>,
+    auth: Auth,
+    multipart: Multipart,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    auth.user.require("image.generate")?;
+    auth.user.require("task.read_own")?;
+    let settings = reference_settings(&app).await?;
+    require_reference_enabled(&settings)?;
+    let limit = settings["max_bytes"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(MAX_IMAGE as u64) as usize;
+    let (bytes, mime) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        stage_reference(&app, multipart, limit),
     )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "REFERENCE_UPLOAD_TIMEOUT",
+            "参考图上传超时",
+        )
+    })??;
+    let mut asset = save_image(&app, auth.user.id, None, "reference", bytes, Some(mime)).await?;
+    asset["reference_id"] = asset["id"].clone();
+    Ok((StatusCode::CREATED, Json(asset)))
+}
+
+async fn stage_reference(
+    app: &App,
+    mut multipart: Multipart,
+    limit: usize,
+) -> ApiResult<(Vec<u8>, String)> {
+    let mut field = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::validation("上传内容无效或超限"))?
+        .filter(|field| field.name() == Some("image"))
+        .ok_or_else(|| ApiError::validation("请上传一个 image 文件"))?;
+    let mime = field
+        .content_type()
+        .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
+        .ok_or_else(|| ApiError::validation("仅支持 PNG/JPEG/WebP"))?
+        .to_string();
+    let staged = StagedReference(
+        app.config
+            .data_dir
+            .join(format!("images/reference-{}.tmp", Uuid::new_v4())),
+    );
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&staged.0).await?;
+    let mut size = 0;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| ApiError::validation("上传读取失败"))?
+    {
+        size += chunk.len();
+        if size > limit {
+            return Err(ApiError::validation(format!(
+                "图片超过管理员设置的 {:.2} MiB 上限",
+                limit as f64 / 1048576.0
+            )));
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    drop(field);
+    if multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::validation("上传格式无效"))?
+        .is_some()
+    {
+        return Err(ApiError::validation("每次只能上传一个 image 文件"));
+    }
+    let bytes = tokio::fs::read(&staged.0).await?;
+    Ok((bytes, mime))
+}
+
+pub async fn object_bytes(app: &App, key: &str, reference: bool) -> ApiResult<Vec<u8>> {
+    let bytes = tokio::fs::read(app.config.data_dir.join(key)).await?;
+    if !reference {
+        return Ok(bytes);
+    }
+    let config = app.config.clone();
+    let purpose = key.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || config.open(&purpose, &bytes))
+        .await
+        .map_err(|_| reference_storage_error())?
+        .map_err(|_| reference_storage_error())
+}
+
+pub fn signed_reference(app: &App, task: Uuid, asset: Uuid) -> ApiResult<String> {
+    let expires = chrono::Utc::now().timestamp() + 600;
+    let claims = format!("{task}:{asset}:{expires}");
+    let token = app
+        .config
+        .seal(REFERENCE_LINK_PURPOSE, claims.as_bytes())
+        .map_err(|_| reference_storage_error())?;
+    Ok(format!(
+        "{}/api/v1/images/reference/{}",
+        app.config.origin,
+        URL_SAFE_NO_PAD.encode(token)
+    ))
+}
+
+pub async fn reference_link(
+    State(app): State<App>,
+    Path(token): Path<String>,
+) -> ApiResult<Response> {
+    if token.len() > 160 {
+        return Err(ApiError::missing());
+    }
+    let token = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ApiError::missing())?;
+    let claims = app
+        .config
+        .open(REFERENCE_LINK_PURPOSE, &token)
+        .map_err(|_| ApiError::missing())?;
+    let claims = std::str::from_utf8(&claims).map_err(|_| ApiError::missing())?;
+    let Some((task, rest)) = claims.split_once(':') else {
+        return Err(ApiError::missing());
+    };
+    let Some((asset, expires)) = rest.split_once(':') else {
+        return Err(ApiError::missing());
+    };
+    let task = task.parse::<Uuid>().map_err(|_| ApiError::missing())?;
+    let asset = asset.parse::<Uuid>().map_err(|_| ApiError::missing())?;
+    if expires.parse::<i64>().map_err(|_| ApiError::missing())? <= chrono::Utc::now().timestamp() {
+        return Err(ApiError::missing());
+    }
+    let row = sqlx::query("SELECT a.object_key,a.kind,a.mime FROM task_reference_assets r JOIN assets a ON a.id=r.asset_id JOIN tasks t ON t.id=r.task_id AND a.user_id=t.user_id WHERE r.task_id=$1 AND a.id=$2")
+        .bind(task).bind(asset).fetch_optional(&app.pool).await?.ok_or_else(ApiError::missing)?;
+    let bytes = object_bytes(
+        &app,
+        row.get("object_key"),
+        row.get::<&str, _>("kind") == "reference",
+    )
+    .await?;
+    let mime = HeaderValue::from_str(row.get("mime")).map_err(|_| reference_storage_error())?;
+    Ok(([("content-type", mime)], Body::from(bytes)).into_response())
 }
 pub async fn upload(
     State(app): State<App>,
@@ -207,7 +476,7 @@ async fn read(
     } else {
         "object_key"
     });
-    let bytes = tokio::fs::read(app.config.data_dir.join(key)).await?;
+    let bytes = object_bytes(app, &key, row.get::<&str, _>("kind") == "reference").await?;
     let mime = if thumbnail {
         "image/png".to_string()
     } else {

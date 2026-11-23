@@ -19,10 +19,39 @@ pub struct Entry {
     pub name: String,
     pub operation: String,
     pub definition: Value,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub image_input: Option<ImageInput>,
     pub installation_id: Option<Uuid>,
     pub package_id: Option<Uuid>,
     pub digest: String,
     pub version: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ImageInput {
+    pub max_count: u8,
+    pub max_bytes: usize,
+    pub accepts_weights: bool,
+}
+impl Entry {
+    pub fn image_input(&self) -> Option<ImageInput> {
+        if self.id == "openai.images.edit" && self.installation_id.is_none() {
+            Some(ImageInput {
+                max_count: 1,
+                max_bytes: crate::storage::MAX_IMAGE,
+                accepts_weights: false,
+            })
+        } else if self
+            .capabilities
+            .iter()
+            .any(|capability| capability == "image.input")
+        {
+            self.image_input.clone()
+        } else {
+            None
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Registry {
@@ -51,7 +80,7 @@ impl Registry {
     pub fn initial() -> Self {
         let entries=[("generate","OpenAI Image Generate","images/generations"),("edit","OpenAI Image Edit","images/edits")].into_iter().map(|(operation,name,path)|{
             let definition=json!({"definition_version":1,"execution":"sync_http","operation":operation,"input_slots":if operation=="edit"{vec!["image"]}else{vec![]},"request":{"method":"POST","path":path,"authentication":"deployment_bearer","encoding":if operation=="edit"{"multipart"}else{"json"},"fields":{"model":{"from":"/model/upstream_model"},"prompt":{"from":"/request/prompt"},"size":{"from":"/request/output/size"},"n":{"constant":1}},"files":if operation=="edit"{json!([{"field":"image","input_slot":"image"}])}else{json!([])}},"response":{"encoding":"json","success_http_statuses":[200],"error_pointer":"/error","images_pointer":"/data","max_images":1,"sources":[{"kind":"url","pointer":"/url"},{"kind":"base64","pointer":"/b64_json"}]}});
-            Entry{id:format!("openai.images.{operation}"),name:name.into(),operation:operation.into(),definition,installation_id:None,package_id:None,digest:"builtin-v1".into(),version:"1".into()}
+            Entry{id:format!("openai.images.{operation}"),name:name.into(),operation:operation.into(),definition,capabilities:vec![],image_input:None,installation_id:None,package_id:None,digest:"builtin-v1".into(),version:"1".into()}
         }).collect();
         Self {
             revision: 1,
@@ -93,9 +122,18 @@ pub async fn available_models(
 pub async fn formats(State(app): State<App>, auth: Auth) -> ApiResult<Json<Value>> {
     let models = available_models(&app, &auth, None).await?;
     let snapshot = app.registry.load_full();
-    let entries:Vec<Value>=snapshot.entries.iter().map(|entry|{let available=models.iter().any(|model|model["entry_format_id"]==entry.id);json!({"id":entry.id,"name":entry.name,"operation":entry.operation,"available":available,"reason":if available{""}else{"暂无可用模型，请联系管理员"}})}).collect();
+    let entries: Vec<Value> = snapshot.entries.iter().map(|entry| {
+        let available = models.iter().any(|model| model["entry_format_id"] == entry.id);
+        let image_input = entry.image_input();
+        let capabilities = if image_input.is_some() { vec!["image.input"] } else { vec![] };
+        json!({"id":entry.id,"name":entry.name,"operation":entry.operation,"capabilities":capabilities,"image_input":image_input,"available":available,"reason":if available{""}else{"暂无可用模型，请联系管理员"}})
+    }).collect();
+    let settings: Value =
+        sqlx::query_scalar("SELECT value FROM app_settings WHERE key='image_input_settings'")
+            .fetch_one(&app.pool)
+            .await?;
     Ok(Json(
-        json!({"registry_revision":snapshot.revision,"items":entries}),
+        json!({"registry_revision":snapshot.revision,"items":entries,"image_input":{"enabled":settings["enabled"],"max_bytes":settings["max_bytes"]}}),
     ))
 }
 pub async fn models(

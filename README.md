@@ -10,6 +10,17 @@
 入口格式与实际模型配置分离。内置 `openai.images.generate`、`openai.images.edit`，
 不预设特定最新模型，也不宣称仅更改地址就兼容所有服务。
 
+## 图生图
+
+在模型管理中绑定声明 `image.input` 的插件或内置 OpenAI Image Edit。
+图片生成页可上传参考图或从图片记录选择。支持权重的插件可为每张图设置 0–1 的强度，默认 0.75。
+管理员在「模型管理 → 图生图设置」中控制开关和上传上限。
+内置 OpenAI Image Edit 接收一张图。参考图顺序与权重的映射见 [插件说明](schemas/README.md)。
+
+数据库升级由服务启动或 `newphoto migrate` 执行。升级前备份 PostgreSQL、图片数据和主密钥。
+在尚未创建新图生图数据时，停服后可在当前源码的 `server` 目录用 SQLx CLI 运行
+`sqlx migrate revert` 来撤回迁移 0003，随后部署旧程序。已创建新图生图数据时，可恢复升级前备份。
+
 ## 预编译平台包
 
 [GitHub Releases](https://github.com/AptS-2077/NewPhoto/releases) 提供 Windows x64、

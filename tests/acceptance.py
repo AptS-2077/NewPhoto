@@ -59,12 +59,12 @@ class Client:
         self.user = result['user']
         return self
 
-    def upload(self, path, field, filename, content, extra=None, expected=201):
+    def upload(self, path, field, filename, content, extra=None, expected=201, mime='application/octet-stream'):
         boundary = 'NewPhoto' + uuid.uuid4().hex
         parts = []
         for key, value in (extra or {}).items():
             parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + content + b'\r\n')
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n'.encode() + content + b'\r\n')
         parts.append(f'--{boundary}--\r\n'.encode())
         return self.ok('POST', path, b''.join(parts), {'Content-Type': f'multipart/form-data; boundary={boundary}'}, expected)
 
